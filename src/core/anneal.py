@@ -1,244 +1,113 @@
 from __future__ import annotations
 import numpy as np
-from typing import Optional, Tuple
+import os, time
+from typing import Optional, Tuple, Dict, Callable
+from tqdm import trange
 
-from . import distance, utils
+from . import greedy
 
+FrameCallback = Optional[Callable[[np.ndarray, int], None]]
 
-try:
-    from numba import njit
-    _HAS_NUMBA = True
-except Exception:
-    _HAS_NUMBA = False
+def _pick_b_within_radius(a: int, sidelen: int, max_dist: int, rng: np.random.Generator) -> int:
+    if max_dist <= 0:
+        return int(rng.integers(0, sidelen * sidelen))
+    ax = a % sidelen
+    ay = a // sidelen
+    dx = int(rng.integers(-max_dist, max_dist + 1))
+    dy = int(rng.integers(-max_dist, max_dist + 1))
+    bx = max(0, min(sidelen - 1, ax + dx))
+    by = max(0, min(sidelen - 1, ay + dy))
+    return int(by * sidelen + bx)
 
+def _save_checkpoint(path: str, assignments: np.ndarray, meta: Dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez_compressed(path, assignments=assignments, **meta)
 
-
-
-
-def build_positions(sidelen: int) -> np.ndarray:
-
-    return utils.build_positions(sidelen) 
-
-
-
-
-
-def initialize_assignments(
+def run_swap_optimizer(
     src_pixels: np.ndarray,
     tgt_pixels: np.ndarray,
     sidelen: int,
-    mode: str = "random",
+    *,
+    init_assignments: Optional[np.ndarray] = None,
+    init_mode: str = "random",
     seed: Optional[int] = None,
-) -> np.ndarray:
-
-
-
-
-
-
-
-
-    N = sidelen * sidelen
-    if src_pixels.shape[0] != N or tgt_pixels.shape[0] != N:
-        raise ValueError("src and tgt must be flattened arrays with shape (N,3) for sidelen.")
-
+    generations: int = 200,
+    swaps_per_generation_per_pixel: float = 1.0,
+    initial_max_dist: int = 8,
+    min_max_dist: int = 1,
+    shrink_every_gen: int = 10,
+    shrink_factor: float = 0.75,
+    alpha: float = 1.0,
+    beta: float = 0.02,
+    metric: str = "rgb",
+    frame_callback: FrameCallback = None,
+    frame_interval_generations: int = 1,
+    checkpoint_path: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, Dict]:
     rng = np.random.default_rng(seed)
+    N = sidelen * sidelen
+    src = np.asarray(src_pixels)
+    tgt = np.asarray(tgt_pixels)
+    if src.shape[0] != N or tgt.shape[0] != N:
+        raise ValueError("src/tgt must be flattened arrays (N,3)")
 
-    if mode == "random":
-        perm = np.arange(N, dtype=np.int32)
-        rng.shuffle(perm)
-        return perm
-
-    elif mode == "color_greedy":
-
-        available = np.ones(N, dtype=bool)
-        assignments = np.empty(N, dtype=np.int32)
-
-
-        for t in range(N):
-            tgt_px = tgt_pixels[t:t+1]  # shape (1,3)
-
-            color_costs = distance.batch_color_distance(src_pixels, np.tile(tgt_px, (N, 1)))
-
-            masked = np.where(available, color_costs, np.inf)
-            best = int(np.argmin(masked))
-            assignments[t] = best
-            available[best] = False
-        return assignments
-
+    if init_assignments is None:
+        assigns = greedy.initialize_assignments(src, tgt, sidelen=sidelen, mode=init_mode, seed=seed)
     else:
-        raise ValueError(f"Unknown init mode: {mode}")
+        assigns = np.asarray(init_assignments, dtype=np.int32).copy()
 
+    nb_delta = getattr(greedy, "nb_local_swap_delta", None)
+    use_numba = nb_delta is not None
+    if use_numba:
+        src_int = src.astype(np.int32)
+        tgt_int = tgt.astype(np.int32)
+    else:
+        src_int = tgt_int = None
 
+    stats = {"start_time": time.time(), "accepted_swaps": 0, "attempted_swaps": 0, "frames_emitted": 0}
+    max_dist = int(initial_max_dist)
+    frame_idx = 0
+    gen_iter = trange(generations, desc="generations") if verbose else range(generations)
 
+    for gen in gen_iter:
+        swaps_this_gen = int(np.round(swaps_per_generation_per_pixel * N))
+        accepted_in_gen = 0
 
+        for _ in range(swaps_this_gen):
+            stats["attempted_swaps"] += 1
+            a = int(rng.integers(0, N))
+            b = _pick_b_within_radius(a, sidelen, max_dist, rng)
+            if a == b:
+                continue
 
-def calc_total_heuristic(
-    assignments: np.ndarray,
-    src_pixels: np.ndarray,
-    tgt_pixels: np.ndarray,
-    sidelen: int,
-    alpha: float = 1.0,
-    beta: float = 0.02,
-    metric: str = "rgb",
-) -> float:
+            if use_numba:
+                delta = float(nb_delta(assigns, src_int, tgt_int, sidelen, a, b, float(alpha), float(beta)))
+            else:
+                delta = greedy.local_swap_delta(assigns, src, tgt, sidelen, a, b, alpha=alpha, beta=beta, metric=metric)
 
+            if delta < 0.0:
+                assigns[a], assigns[b] = assigns[b], assigns[a]
+                accepted_in_gen += 1
+                stats["accepted_swaps"] += 1
 
+        if (gen + 1) % shrink_every_gen == 0 and gen > 0:
+            new_max = max(min_max_dist, int(round(max_dist * shrink_factor)))
+            if new_max < max_dist:
+                max_dist = new_max
 
+        if frame_callback is not None and ((gen % frame_interval_generations) == 0 or gen == generations - 1):
+            frame_callback(assigns.copy(), frame_idx)
+            stats["frames_emitted"] += 1
+            frame_idx += 1
 
+        if checkpoint_path is not None and ((gen + 1) % max(1, generations // 10) == 0 or gen == generations - 1):
+            meta = {"gen": gen, "accepted_swaps": stats["accepted_swaps"], "attempted_swaps": stats["attempted_swaps"], "max_dist": max_dist}
+            _save_checkpoint(checkpoint_path, assigns, meta)
 
+        if verbose:
+            gen_iter.set_postfix({"accepted": accepted_in_gen, "max_dist": max_dist})
 
-    N = sidelen * sidelen
-    if assignments.shape[0] != N:
-        raise ValueError("assignments length mismatch sidelen.")
-
-    pos = build_positions(sidelen)
-    total = 0.0
-
-    assigned_src = src_pixels[assignments]
-
-    color_costs = distance.batch_color_distance(assigned_src, tgt_pixels, metric=metric).astype(np.float64)
-
-    src_pos = pos[assignments]  # (N,2)
-    tgt_pos = pos  # (N,2)
-    dx = src_pos[:, 0].astype(np.float64) - tgt_pos[:, 0].astype(np.float64)
-    dy = src_pos[:, 1].astype(np.float64) - tgt_pos[:, 1].astype(np.float64)
-    spatial = np.sqrt(dx * dx + dy * dy)
-    total = float(np.sum(alpha * color_costs + beta * spatial))
-    return total
-
-
-
-
-
-def local_swap_delta(
-    assignments: np.ndarray,
-    src_pixels: np.ndarray,
-    tgt_pixels: np.ndarray,
-    sidelen: int,
-    a: int,
-    b: int,
-    alpha: float = 1.0,
-    beta: float = 0.02,
-    metric: str = "rgb",
-) -> float:
-
-
-
-
-
-    if a == b:
-        return 0.0
-    N = sidelen * sidelen
-    if not (0 <= a < N and 0 <= b < N):
-        raise IndexError("a or b out of range")
-
-    pos = build_positions(sidelen)
-
-    sa = int(assignments[a])
-    sb = int(assignments[b])
-
-    # old costs
-
-    old_color_a = distance.batch_color_distance(src_pixels[sa:sa+1], tgt_pixels[a:a+1], metric=metric)[0]
-    old_color_b = distance.batch_color_distance(src_pixels[sb:sb+1], tgt_pixels[b:b+1], metric=metric)[0]
-
-    # spatial
-    src_pos_sa = tuple(int(x) for x in pos[sa])
-    src_pos_sb = tuple(int(x) for x in pos[sb])
-    tgt_pos_a = tuple(int(x) for x in pos[a])
-    tgt_pos_b = tuple(int(x) for x in pos[b])
-    old_sp_a = distance.spatial_distance(src_pos_sa, tgt_pos_a)
-    old_sp_b = distance.spatial_distance(src_pos_sb, tgt_pos_b)
-
-    old = alpha * old_color_a + beta * old_sp_a + alpha * old_color_b + beta * old_sp_b
-
-
-    new_color_a = distance.batch_color_distance(src_pixels[sb:sb+1], tgt_pixels[a:a+1], metric=metric)[0]
-    new_color_b = distance.batch_color_distance(src_pixels[sa:sa+1], tgt_pixels[b:b+1], metric=metric)[0]
-    new_sp_a = distance.spatial_distance(src_pos_sb, tgt_pos_a)
-    new_sp_b = distance.spatial_distance(src_pos_sa, tgt_pos_b)
-    new = alpha * new_color_a + beta * new_sp_a + alpha * new_color_b + beta * new_sp_b
-
-    return float(new - old)
-
-
-
-
-
-if _HAS_NUMBA:
-
-
-
-    @njit
-    def _nb_color_dist_sq(a0, a1):
-        d0 = a0[0] - a1[0]
-        d1 = a0[1] - a1[1]
-        d2 = a0[2] - a1[2]
-        return d0 * d0 + d1 * d1 + d2 * d2
-
-    @njit
-    def nb_local_swap_delta(
-        assignments,
-        src_pixels_int32,
-        tgt_pixels_int32,
-        sidelen,
-        a,
-        b,
-        alpha,
-        beta
-    ):
-        if a == b:
-            return 0.0
-        N = sidelen * sidelen
-
-        sa = assignments[a]
-        sb = assignments[b]
-
-
-        old_ca = _nb_color_dist_sq(src_pixels_int32[sa], tgt_pixels_int32[a])
-        old_cb = _nb_color_dist_sq(src_pixels_int32[sb], tgt_pixels_int32[b])
-
-        ax = a % sidelen
-        ay = a // sidelen
-        bx = b % sidelen
-        by = b // sidelen
-        src_ax = sa % sidelen
-        src_ay = sa // sidelen
-        src_bx = sb % sidelen
-        src_by = sb // sidelen
-        old_sp_a = ((src_ax - ax) ** 2 + (src_ay - ay) ** 2) ** 0.5
-        old_sp_b = ((src_bx - bx) ** 2 + (src_by - by) ** 2) ** 0.5
-        old = alpha * old_ca + beta * old_sp_a + alpha * old_cb + beta * old_sp_b
-
-        new_ca = _nb_color_dist_sq(src_pixels_int32[sb], tgt_pixels_int32[a])
-        new_cb = _nb_color_dist_sq(src_pixels_int32[sa], tgt_pixels_int32[b])
-        new_sp_a = ((src_bx - ax) ** 2 + (src_by - ay) ** 2) ** 0.5
-        new_sp_b = ((src_ax - bx) ** 2 + (src_ay - by) ** 2) ** 0.5
-        new = alpha * new_ca + beta * new_sp_a + alpha * new_cb + beta * new_sp_b
-        return new - old
-
-else:
-    nb_local_swap_delta = None  # type: ignore
-
-
-
-def demo_init_and_score(source_img, target_img, sidelen=64, init_mode="random", seed=0, alpha=1.0, beta=0.02):
-    
-    def _normalize(img):
-        arr = np.asarray(img)
-        if arr.ndim == 3:
-            h, w = arr.shape[0], arr.shape[1]
-            if h != sidelen or w != sidelen:
-                raise ValueError("Image must be resized to sidelen x sidelen before calling this helper.")
-            return arr.reshape(-1, 3).astype(np.int32)
-        if arr.ndim == 2 and arr.shape[1] == 3:
-            return arr.astype(np.int32)
-        raise ValueError("Unsupported image shape")
-
-    src = _normalize(source_img)
-    tgt = _normalize(target_img)
-
-    assigns = initialize_assignments(src, tgt, sidelen=sidelen, mode=init_mode, seed=seed)
-    score = calc_total_heuristic(assigns, src, tgt, sidelen, alpha=alpha, beta=beta)
-    return assigns, score
+    stats["end_time"] = time.time()
+    stats["duration_s"] = stats["end_time"] - stats["start_time"]
+    return assigns, stats
