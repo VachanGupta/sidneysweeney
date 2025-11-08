@@ -1,0 +1,9 @@
+numpy
+pillow
+imageio
+numba
+tqdm
+scipy
+matplotlib
+streamlit
+gradio
